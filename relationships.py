@@ -224,12 +224,14 @@ def color_array_and_colorbar(prices_array: np.ndarray, mode: str, clip_pct: floa
 		cbar = dict(title=dict(text="Price ($)", side="right"), thickness=15, xanchor="left")
 		return vals, cbar, "RdBu", float(np.min(vals)), float(np.max(vals))
 
-	# Clipped linear
-	if mode == "Clipped (95th pct)":
+	# Clipped linear (percentile)
+	if mode == "Clipped (percentile)":
 		hi = np.percentile(p, clip_pct)
 		vals = np.clip(p, None, hi)
-		cbar = dict(title=dict(text=f"Price ($) (clipped @ {int(clip_pct)}th pct)", side="right"),
-					thickness=15, xanchor="left")
+		cbar = dict(
+			title=dict(text=f"Price ($) (clipped @ {clip_pct:.1f}th pct)", side="right"),
+			thickness=15, xanchor="left"
+		)
 		return vals, cbar, "RdBu", float(np.min(vals)), float(np.max(vals))
 
 	# Log (base 10) — normalize with cmin/cmax so full color range is used
@@ -270,14 +272,16 @@ def sqrt_sizes(deg_values, min_size: int, max_size: int):
 	return min_size + norm * (max_size - min_size)
 
 # ----------------------------
-# Plot graph
+# Plot graph (with highlight overlays)
 # ----------------------------
 def plot_graph(H: nx.DiGraph,
 			   label_top_percent: int = 10,
 			   color_mode: str = "Log (base 10)",
+			   clip_pct: float = 95.0,
 			   min_size: int = 8,
 			   max_size: int = 50,
-			   height: int = 900):
+			   height: int = 900,
+			   highlight_nodes: set[str] | None = None):
 	if H.number_of_nodes() == 0:
 		return go.Figure()
 
@@ -287,24 +291,40 @@ def plot_graph(H: nx.DiGraph,
 	# Price -> color
 	prices = {n: H.nodes[n].get("price", np.nan) for n in H.nodes()}
 	price_vals = np.array([prices[n] for n in H.nodes()], dtype=float)
-	color_values, colorbar_dict, colorscale_name, cmin, cmax = color_array_and_colorbar(price_vals, color_mode)
+	color_values, colorbar_dict, colorscale_name, cmin, cmax = color_array_and_colorbar(
+		price_vals, color_mode, clip_pct=clip_pct
+	)
 
 	# Labels for top % by indegree
 	counts = np.array(list(indeg.values()), dtype=float)
 	cutoff = np.percentile(counts, 100 - label_top_percent) if len(counts) else 0
 	top_label_nodes = {n for n, v in indeg.items() if v >= cutoff}
 
-	# Edges
-	edge_x, edge_y = [], []
+	# Edge coords (base)
+	base_edge_x, base_edge_y = [], []
+	hi_edge_x, hi_edge_y = [], []
+	highlight_nodes = highlight_nodes or set()
+
 	for u, v in H.edges():
 		x0, y0 = pos[u]; x1, y1 = pos[v]
-		edge_x += [x0, x1, None]; edge_y += [y0, y1, None]
+		if (u in highlight_nodes) or (v in highlight_nodes):
+			hi_edge_x += [x0, x1, None]; hi_edge_y += [y0, y1, None]
+		else:
+			base_edge_x += [x0, x1, None]; base_edge_y += [y0, y1, None]
 
-	edge_trace = go.Scatter(
-		x=edge_x, y=edge_y,
-		line=dict(width=0.5, color="#999"),
+	base_edge_trace = go.Scatter(
+		x=base_edge_x, y=base_edge_y,
+		line=dict(width=0.5, color="#BBBBBB"),
 		hoverinfo="none",
-		mode="lines"
+		mode="lines",
+		showlegend=False
+	)
+	hi_edge_trace = go.Scatter(
+		x=hi_edge_x, y=hi_edge_y,
+		line=dict(width=1.5, color="#666666"),
+		hoverinfo="none",
+		mode="lines",
+		showlegend=False
 	)
 
 	# Nodes
@@ -312,45 +332,104 @@ def plot_graph(H: nx.DiGraph,
 	node_x = [pos[n][0] for n in nodes]
 	node_y = [pos[n][1] for n in nodes]
 	deg_values = [indeg.get(n, 0) for n in nodes]
-	node_size = sqrt_sizes(deg_values, min_size=min_size, max_size=max_size)
+	base_sizes = sqrt_sizes(deg_values, min_size=min_size, max_size=max_size)
 
-	node_text  = []
-	node_hover = []
+	# Base node trace (all nodes)
+	base_text  = []
+	base_hover = []
 	for n in nodes:
 		price_display = prices[n]
 		if isinstance(price_display, float) and np.isnan(price_display):
 			price_display = "N/A"
 		full_name = H.nodes[n].get("name", n)
-		node_hover.append(
+		base_hover.append(
 			f"ID: {n}<br>"
 			f"Name: {full_name}<br>"
 			f"Price: {price_display}<br>"
 			f"In-degree: {indeg.get(n, 0)}"
 		)
-		node_text.append(full_name if n in top_label_nodes else "")
+		base_text.append(full_name if n in top_label_nodes else "")
 
-	node_trace = go.Scatter(
+	base_node_trace = go.Scatter(
 		x=node_x, y=node_y,
 		mode="markers+text",
-		text=node_text,
+		text=base_text,
 		textposition="top center",
-		hovertext=node_hover,
+		hovertext=base_hover,
 		hoverinfo="text",
 		marker=dict(
 			showscale=True,
 			colorscale=colorscale_name,
 			reversescale=True,      # low price -> red, high price -> blue
 			color=color_values,     # linear/clip/log values
-			cmin=cmin,              # <-- ensure full use of the scale
-			cmax=cmax,              # <-- ensure full use of the scale
-			size=node_size,         # SQRT sizing
+			cmin=cmin,
+			cmax=cmax,
+			size=base_sizes,
 			colorbar=colorbar_dict,
-			line_width=1
-		)
+			line=dict(width=1, color="#333")
+		),
+		name="Products"
 	)
 
+	# Highlight node overlay (subset only, thicker outline + slightly larger)
+	if highlight_nodes:
+		hi_nodes = [n for n in nodes if n in highlight_nodes]
+		if hi_nodes:
+			hi_x = [pos[n][0] for n in hi_nodes]
+			hi_y = [pos[n][1] for n in hi_nodes]
+			hi_sizes = []
+			hi_colors = []
+			hi_text = []
+			hi_hover = []
+
+			node_index = {n: i for i, n in enumerate(nodes)}
+			for n in hi_nodes:
+				idx = node_index[n]
+				hi_sizes.append(base_sizes[idx] * 1.2)  # 20% larger
+				hi_colors.append(color_values[idx])      # keep same colormap value
+				price_display = prices[n]
+				if isinstance(price_display, float) and np.isnan(price_display):
+					price_display = "N/A"
+				full_name = H.nodes[n].get("name", n)
+				hi_hover.append(
+					f"ID: {n}<br>"
+					f"Name: {full_name}<br>"
+					f"Price: {price_display}<br>"
+					f"In-degree: {indeg.get(n, 0)}"
+				)
+				# Always show label for highlighted, plus if already in top_label_nodes
+				hi_text.append(full_name)
+
+			hi_node_trace = go.Scatter(
+				x=hi_x, y=hi_y,
+				mode="markers+text",
+				text=hi_text,
+				textposition="top center",
+				hovertext=hi_hover,
+				hoverinfo="text",
+				marker=dict(
+					showscale=False,           # avoid duplicate colorbar
+					colorscale=colorscale_name,
+					reversescale=True,
+					color=hi_colors,
+					cmin=cmin,
+					cmax=cmax,
+					size=hi_sizes,
+					line=dict(width=3, color="#000")  # thick black outline
+				),
+				name="Highlighted"
+			)
+		else:
+			hi_node_trace = None
+	else:
+		hi_node_trace = None
+
+	traces = [base_edge_trace, hi_edge_trace, base_node_trace]
+	if hi_node_trace is not None:
+		traces.append(hi_node_trace)
+
 	fig = go.Figure(
-		data=[edge_trace, node_trace],
+		data=traces,
 		layout=go.Layout(
 			title=dict(text="Product Recommendation Network (Top-N hubs + neighbors)", font=dict(size=20)),
 			showlegend=False,
@@ -401,7 +480,7 @@ if not uploaded:
 
 df = load_csv(uploaded)
 
-# Sidebar controls
+# Sidebar controls — Filters
 st.sidebar.header("Filters (Contextual)")
 brand_vals = sorted(df.get("brand_name", pd.Series(dtype=str)).dropna().unique().tolist())
 type_vals  = sorted(df.get("type", pd.Series(dtype=str)).dropna().unique().tolist())
@@ -409,7 +488,7 @@ type_vals  = sorted(df.get("type", pd.Series(dtype=str)).dropna().unique().tolis
 brand_filter = st.sidebar.multiselect("brand_name", brand_vals)
 type_filter  = st.sidebar.multiselect("type", type_vals)
 
-# Product name filter
+# Product name filter for graph content (Option B)
 st.sidebar.markdown("---")
 name_query = st.sidebar.text_input("Product name contains (case-insensitive)", "")
 df["_full_name"] = (df.get("product_name", "").fillna("").astype(str).str.strip() + " " +
@@ -420,16 +499,41 @@ if name_query.strip():
 						 .dropna().unique().tolist())[:200]
 name_exact = st.sidebar.multiselect("Or pick exact product(s)", suggestions)
 
+# Display controls
 st.sidebar.header("Display")
 top_n = st.sidebar.slider("Top-N hubs (by in-degree)", min_value=10, max_value=1000, value=100, step=10)
 label_top_percent = st.sidebar.slider("Label top % nodes (by in-degree)", min_value=1, max_value=50, value=10, step=1)
-color_mode = st.sidebar.selectbox("Color scale for price", ["Log (base 10)", "Linear", "Clipped (95th pct)"])
+
+# Color scale options + percentile slider for clipping
+color_mode = st.sidebar.selectbox("Color scale for price", ["Log (base 10)", "Linear", "Clipped (percentile)"])
+clip_pct = 95.0
+if color_mode == "Clipped (percentile)":
+	clip_pct = st.sidebar.slider("Clip at percentile", min_value=80.0, max_value=99.9, value=95.0, step=0.1)
+
 graph_height = st.sidebar.slider("Graph height (px)", 500, 1600, 900, step=50)
 
 # SQRT sizing controls
 st.sidebar.markdown("---")
 min_size = st.sidebar.slider("Min bubble size (px)", 4, 30, 8)
 max_size = st.sidebar.slider("Max bubble size (px)", 20, 160, 50)
+
+# ----------------------------
+# Search Highlight (overlay)
+# ----------------------------
+st.sidebar.header("Search Highlight")
+hl_name_query = st.sidebar.text_input("Highlight: name contains", "")
+hl_suggestions = []
+if hl_name_query.strip():
+	hl_suggestions = sorted(df.loc[df["_full_name"].str.contains(hl_name_query.strip(), case=False, na=False), "_full_name"]
+							.dropna().unique().tolist())[:200]
+hl_name_exact = st.sidebar.multiselect("Highlight: pick exact product(s)", hl_suggestions)
+
+hl_ids_raw = st.sidebar.text_input("Highlight: DM IDs (comma/space)", "")
+hl_ids = set()
+if hl_ids_raw.strip():
+	for tok in re.split(r"[,\s]+", hl_ids_raw.strip()):
+		if tok:
+			hl_ids.add(tok.strip())
 
 # Build full graph (contextual filter applied here, including product name)
 G_full = build_graph(
@@ -443,16 +547,34 @@ G_full = build_graph(
 # Build Option-B Top-N subgraph: hubs + neighbors
 H = top_n_with_neighbors(G_full, top_n=top_n)
 
+# Build highlight set mapped into H (by name & ID)
+highlight_nodes = set()
+if H.number_of_nodes() > 0:
+	# Map node -> name in H
+	names_map_H = nx.get_node_attributes(H, "name")
+	if hl_name_query and hl_name_query.strip():
+		q = hl_name_query.strip().lower()
+		highlight_nodes |= {n for n, nm in names_map_H.items() if q in str(nm).lower()}
+	if hl_name_exact and len(hl_name_exact) > 0:
+		exact_set = set(hl_name_exact)
+		highlight_nodes |= {n for n, nm in names_map_H.items() if nm in exact_set}
+	if hl_ids:
+		highlight_nodes |= {n for n in H.nodes() if n in hl_ids}
+
 st.write(f"**Filtered graph:** {G_full.number_of_nodes()} nodes / {G_full.number_of_edges()} edges")
 st.write(f"**Displayed subgraph (Top-{top_n} hubs + neighbors):** {H.number_of_nodes()} nodes / {H.number_of_edges()} edges")
+if highlight_nodes:
+	st.write(f"**Highlighted nodes:** {len(highlight_nodes)}")
 
 fig = plot_graph(
 	H,
 	label_top_percent=label_top_percent,
 	color_mode=color_mode,
+	clip_pct=clip_pct,
 	min_size=min_size,
 	max_size=max_size,
-	height=graph_height
+	height=graph_height,
+	highlight_nodes=highlight_nodes
 )
 st.plotly_chart(fig, use_container_width=True)
 
