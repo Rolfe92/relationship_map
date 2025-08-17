@@ -638,7 +638,7 @@ top_n = st.sidebar.slider("Top-N hubs (by in-degree)", min_value=10, max_value=1
 label_top_percent = st.sidebar.slider("Label top % nodes (by in-degree)", min_value=1, max_value=50, value=10, step=1)
 
 # Layout selector
-layout_choice = st.sidebar.selectbox("Layout", ["Radial by in-degree (bullseye)", "Kamada–Kawai", "Spring"])
+layout_choice = st.sidebar.selectbox("Layout", ["Spring", "Radial by in-degree (bullseye)", "Kamada–Kawai"])
 
 # Price colour options + percentile slider for clipping
 colour_mode = st.sidebar.selectbox("Colour scale for price", ["Clipped (percentile)", "Log (base 10)", "Linear"])
