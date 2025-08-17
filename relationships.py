@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import networkx as nx
 import streamlit as st
 
-st.set_page_config(layout="wide", page_title="Product Recommendation Network (Option B)")
+st.set_page_config(layout="wide", page_title="Product Recommendation Network")
 
 # ----------------------------
 # Helpers
@@ -471,7 +471,7 @@ def to_excel_bytes(nodes_df, edges_df):
 # ----------------------------
 # UI
 # ----------------------------
-st.title("🍷 Product Recommendation Network — Option B (Contextual)")
+st.title("🍷 Product Recommendation Network")
 
 uploaded = st.file_uploader("Upload your product CSV", type=["csv"])
 if not uploaded:
@@ -508,7 +508,7 @@ label_top_percent = st.sidebar.slider("Label top % nodes (by in-degree)", min_va
 color_mode = st.sidebar.selectbox("Color scale for price", ["Log (base 10)", "Linear", "Clipped (percentile)"])
 clip_pct = 95.0
 if color_mode == "Clipped (percentile)":
-	clip_pct = st.sidebar.slider("Clip at percentile", min_value=80.0, max_value=99.9, value=95.0, step=0.1)
+	clip_pct = st.sidebar.slider("Clip at percentile", min_value=1.0, max_value=99.9, value=80.0, step=0.1)
 
 graph_height = st.sidebar.slider("Graph height (px)", 500, 1600, 900, step=50)
 
