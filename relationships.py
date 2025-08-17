@@ -1,5 +1,6 @@
 # app.py
 import re
+import colorsys
 from io import BytesIO
 
 import numpy as np
@@ -7,6 +8,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import networkx as nx
 import streamlit as st
+
+# Louvain community detection (python-louvain package)
+import community as community_louvain
 
 st.set_page_config(layout="wide", page_title="Product Recommendation Network")
 
@@ -28,8 +32,7 @@ def clean_price(val):
 	"""Parse '$12.34' or '12.34' -> float; handle None/NaN/garbage."""
 	if pd.isna(val):
 		return np.nan
-	s = str(val)
-	s = re.sub(r"[^\d\.\-]", "", s)  # strip $, commas, spaces, etc.
+	s = re.sub(r"[^\d\.\-]", "", str(val))
 	try:
 		return float(s) if s != "" else np.nan
 	except:
@@ -50,7 +53,7 @@ def build_full_name(row):
 def find_rec_columns(df):
 	"""
 	Return:
-	  - url cols (preferred: *_url; else any recommended_product_* that isn't *_name/_title/_subtitle)
+	  - URL cols (preferred: *_url; else any recommended_product_* that isn't *_name/_title/_subtitle)
 	  - mapping index->name col if present (recommended_product_{i}_name or title/subtitle pair)
 	"""
 	url_cols = [c for c in df.columns if c.startswith("recommended_product_") and c.endswith("_url")]
@@ -61,11 +64,11 @@ def find_rec_columns(df):
 					and not c.endswith("_title")
 					and not c.endswith("_subtitle")]
 	name_cols = {}
-	for i in range(1, 201):
+	for i in range(1, 501):
 		c = f"recommended_product_{i}_name"
 		if c in df.columns:
 			name_cols[i] = c
-	for i in range(1, 201):
+	for i in range(1, 501):
 		t = f"recommended_product_{i}_title"
 		s = f"recommended_product_{i}_subtitle"
 		if t in df.columns and s in df.columns and i not in name_cols:
@@ -82,9 +85,9 @@ def build_graph(df: pd.DataFrame,
 				name_exact: list[str] | None) -> nx.DiGraph:
 	"""
 	Build the full directed graph, then apply contextual filters:
-	  - Brand/type filters (Option B): keep selected nodes + neighbors
-	  - Product name filter (Option B): keep name-matched nodes + neighbors
-	If multiple filters provided, the intersection of selected sets is used before adding neighbors.
+	  - brand/type filters: keep selected nodes + neighbours
+	  - product name filter: keep name-matched nodes + neighbours
+	If multiple filters provided, the intersection of selected sets is used before adding neighbours.
 	"""
 	df = df.copy()
 
@@ -148,7 +151,7 @@ def build_graph(df: pd.DataFrame,
 	# ---- Build selected set from filters (intersection first) ----
 	selected = set(G.nodes())
 
-	# Brand/type selection
+	# brand/type selection
 	if (brand_filter and len(brand_filter) > 0) or (type_filter and len(type_filter) > 0):
 		by_brand_type = {
 			n for n, data in G.nodes(data=True)
@@ -168,7 +171,7 @@ def build_graph(df: pd.DataFrame,
 		by_query = {n for n, nm in names_map.items() if q in str(nm).lower()}
 		selected = selected & by_query
 
-	# If any filter applied, include neighbors for context (Option B)
+	# If any filter applied, include neighbours for context
 	any_filter = (
 		(brand_filter and len(brand_filter) > 0) or
 		(type_filter and len(type_filter) > 0) or
@@ -186,9 +189,9 @@ def build_graph(df: pd.DataFrame,
 	return G
 
 # ----------------------------
-# Top-N hubs + neighbors (Option B)
+# Top-N hubs + neighbours
 # ----------------------------
-def top_n_with_neighbors(G: nx.DiGraph, top_n: int) -> nx.DiGraph:
+def top_n_with_neighbours(G: nx.DiGraph, top_n: int) -> nx.DiGraph:
 	if G.number_of_nodes() == 0:
 		return G.copy()
 	indeg = dict(G.in_degree())
@@ -201,11 +204,11 @@ def top_n_with_neighbors(G: nx.DiGraph, top_n: int) -> nx.DiGraph:
 	return G.subgraph(keep).copy()
 
 # ----------------------------
-# Price -> color mapping (with explicit cmin/cmax on LOG)
+# Price -> colour mapping (with explicit cmin/cmax on LOG)
 # ----------------------------
-def color_array_and_colorbar(prices_array: np.ndarray, mode: str, clip_pct: float = 95.0):
+def colour_array_and_colourbar(prices_array: np.ndarray, mode: str, clip_pct: float = 95.0):
 	"""
-	Return (color_values, colorbar_dict, colorscale, cmin, cmax)
+	Return (colour_values, colourbar_dict, colourscale, cmin, cmax)
 	"""
 	p = np.array(prices_array, dtype=float)
 	p[~np.isfinite(p)] = np.nan
@@ -234,12 +237,12 @@ def color_array_and_colorbar(prices_array: np.ndarray, mode: str, clip_pct: floa
 		)
 		return vals, cbar, "RdBu", float(np.min(vals)), float(np.max(vals))
 
-	# Log (base 10) — normalize with cmin/cmax so full color range is used
+	# Log (base 10) — normalise with cmin/cmax so full colour range is used
 	vals = np.log10(p)
 	vmin = float(np.min(vals))
 	vmax = float(np.max(vals))
 
-	# Human-friendly tick labels showing real $ on log scale; keep within [vmin, vmax]
+	# Human-friendly tick labels showing real $ on log scale
 	canonical = np.array([5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 300, 500, 750, 1000], dtype=float)
 	lo_p, hi_p = float(10**vmin), float(10**vmax)
 	tick_prices = canonical[(canonical >= lo_p) & (canonical <= hi_p)]
@@ -272,27 +275,163 @@ def sqrt_sizes(deg_values, min_size: int, max_size: int):
 	return min_size + norm * (max_size - min_size)
 
 # ----------------------------
-# Plot graph (with highlight overlays)
+# Layouts
+# ----------------------------
+def radial_by_indegree_pos(G: nx.DiGraph, rings=6, seed=42):
+	"""
+	Concentric rings by in-degree percentile; highest in-degree at centre.
+	Returns dict: node -> (x,y)
+	"""
+	if G.number_of_nodes() == 0:
+		return {}
+	rng = np.random.default_rng(seed)
+	indeg = dict(G.in_degree())
+	vals = np.array(list(indeg.values()), dtype=float)
+	percentiles = np.percentile(vals, np.linspace(0, 100, rings))
+	shells = [[] for _ in range(rings)]
+	nodes = list(G.nodes())
+	for n in nodes:
+		v = indeg.get(n, 0)
+		idx = np.searchsorted(percentiles, v, side="right") - 1
+		idx = int(np.clip(idx, 0, rings - 1))
+		shells[idx].append(n)
+
+	pos = {}
+	for r, ring_nodes in enumerate(shells):
+		if not ring_nodes:
+			continue
+		R = (r + 1) / rings  # (0..1]
+		if r == rings - 1:
+			for i, n in enumerate(ring_nodes):
+				jitter = 0.02 * rng.normal(size=2)
+				pos[n] = (0.02 * i + jitter[0], 0.02 * i + jitter[1])
+		else:
+			k = len(ring_nodes)
+			angles = np.linspace(0, 2*np.pi, k, endpoint=False)
+			rng.shuffle(angles)
+			for a, n in zip(angles, ring_nodes):
+				pos[n] = (R * np.cos(a), R * np.sin(a))
+	return pos
+
+def compute_positions(G: nx.DiGraph, layout_choice: str):
+	if layout_choice == "Radial by in-degree (bullseye)":
+		return radial_by_indegree_pos(G, rings=6, seed=42)
+	elif layout_choice == "Kamada–Kawai":
+		return nx.kamada_kawai_layout(G)
+	else:  # Spring
+		return nx.spring_layout(G, k=0.3, seed=42)
+
+# ----------------------------
+# Community colours & hulls
+# ----------------------------
+def pastel_hsl_palette(n):
+	"""Return n distinct pastel colours as hex."""
+	cols = []
+	for i in range(n):
+		h = i / max(1, n)
+		s = 0.45
+		l = 0.80
+		r, g, b = colorsys.hls_to_rgb(h, l, s)
+		cols.append('#%02x%02x%02x' % (int(r*255), int(g*255), int(b*255)))
+	return cols
+
+def community_hulls_traces(G: nx.Graph, pos: dict, min_size: int = 15, opacity: float = 0.2):
+	"""
+	Build translucent polygon traces for communities (size >= min_size).
+	Uses a simple convex hull per community (2+ nodes handled with small circle).
+	"""
+	if G.number_of_nodes() == 0:
+		return []
+
+	# Undirected for community finding
+	parts = community_louvain.best_partition(G.to_undirected())
+	comm_to_nodes = {}
+	for n, cid in parts.items():
+		comm_to_nodes.setdefault(cid, []).append(n)
+
+	# Colours
+	comm_ids = sorted([cid for cid, nodes in comm_to_nodes.items() if len(nodes) >= min_size])
+	palette = pastel_hsl_palette(len(comm_ids))
+
+	traces = []
+	for colour, cid in zip(palette, comm_ids):
+		nodes = comm_to_nodes[cid]
+		if len(nodes) < min_size:
+			continue
+		pts = np.array([pos[n] for n in nodes if n in pos], dtype=float)
+		if pts.shape[0] == 0:
+			continue
+		if pts.shape[0] == 1:
+			# single node: draw tiny circle
+			x0, y0 = pts[0]
+			circle = go.Scatter(
+				x=[x0 + 0.02*np.cos(t) for t in np.linspace(0, 2*np.pi, 40)],
+				y=[y0 + 0.02*np.sin(t) for t in np.linspace(0, 2*np.pi, 40)],
+				fill="toself", mode="lines", line=dict(width=0),
+				hoverinfo="none",
+				name=f"Community {cid}",
+				marker=dict(color=colour),
+				opacity=opacity
+			)
+			traces.append(circle)
+			continue
+
+		# Convex hull
+		try:
+			from scipy.spatial import ConvexHull
+			hull = ConvexHull(pts)
+			hull_pts = pts[hull.vertices]
+			hull_trace = go.Scatter(
+				x=np.append(hull_pts[:, 0], hull_pts[0, 0]),
+				y=np.append(hull_pts[:, 1], hull_pts[0, 1]),
+				fill="toself",
+				mode="lines",
+				line=dict(width=0),
+				hoverinfo="none",
+				name=f"Community {cid}",
+				marker=dict(color=colour),
+				opacity=opacity
+			)
+			traces.append(hull_trace)
+		except Exception:
+			# Fallback: bounding box
+			xmin, ymin = pts.min(axis=0)
+			xmax, ymax = pts.max(axis=0)
+			xpoly = [xmin, xmax, xmax, xmin, xmin]
+			ypoly = [ymin, ymin, ymax, ymax, ymin]
+			traces.append(go.Scatter(
+				x=xpoly, y=ypoly, fill="toself", mode="lines", line=dict(width=0),
+				hoverinfo="none",
+				name=f"Community {cid}", marker=dict(color=colour), opacity=opacity
+			))
+	return traces
+
+# ----------------------------
+# Plot graph (with highlight overlays & communities)
 # ----------------------------
 def plot_graph(H: nx.DiGraph,
 			   label_top_percent: int = 10,
-			   color_mode: str = "Log (base 10)",
+			   colour_mode: str = "Clipped (percentile)",
 			   clip_pct: float = 95.0,
 			   min_size: int = 8,
 			   max_size: int = 50,
 			   height: int = 900,
-			   highlight_nodes: set[str] | None = None):
+			   highlight_nodes: set[str] | None = None,
+			   layout_choice: str = "Spring",
+			   show_communities: bool = False,
+			   community_min_size: int = 15,
+			   community_opacity: float = 0.2):
 	if H.number_of_nodes() == 0:
 		return go.Figure()
 
-	pos = nx.spring_layout(H, k=0.3, seed=42)
+	pos = compute_positions(H, layout_choice)
 	indeg = dict(H.in_degree())
 
-	# Price -> color
+	# Price -> colour
 	prices = {n: H.nodes[n].get("price", np.nan) for n in H.nodes()}
 	price_vals = np.array([prices[n] for n in H.nodes()], dtype=float)
-	color_values, colorbar_dict, colorscale_name, cmin, cmax = color_array_and_colorbar(
-		price_vals, color_mode, clip_pct=clip_pct
+	colour_values, colourbar_dict, colourscale_name, cmin, cmax = colour_array_and_colourbar(
+		price_vals, colour_mode, clip_pct=clip_pct
 	)
 
 	# Labels for top % by indegree
@@ -300,7 +439,7 @@ def plot_graph(H: nx.DiGraph,
 	cutoff = np.percentile(counts, 100 - label_top_percent) if len(counts) else 0
 	top_label_nodes = {n for n, v in indeg.items() if v >= cutoff}
 
-	# Edge coords (base)
+	# Edge coords (base vs highlighted)
 	base_edge_x, base_edge_y = [], []
 	hi_edge_x, hi_edge_y = [], []
 	highlight_nodes = highlight_nodes or set()
@@ -334,7 +473,6 @@ def plot_graph(H: nx.DiGraph,
 	deg_values = [indeg.get(n, 0) for n in nodes]
 	base_sizes = sqrt_sizes(deg_values, min_size=min_size, max_size=max_size)
 
-	# Base node trace (all nodes)
 	base_text  = []
 	base_hover = []
 	for n in nodes:
@@ -359,47 +497,40 @@ def plot_graph(H: nx.DiGraph,
 		hoverinfo="text",
 		marker=dict(
 			showscale=True,
-			colorscale=colorscale_name,
-			reversescale=True,      # low price -> red, high price -> blue
-			color=color_values,     # linear/clip/log values
+			colorscale=colourscale_name,   # Plotly key must be 'colorscale'
+			reversescale=True,             # low price -> red, high price -> blue
+			color=colour_values,           # Plotly key must be 'color'
 			cmin=cmin,
 			cmax=cmax,
 			size=base_sizes,
-			colorbar=colorbar_dict,
+			colorbar=colourbar_dict,       # Plotly key must be 'colorbar'
 			line=dict(width=1, color="#333")
 		),
 		name="Products"
 	)
 
-	# Highlight node overlay (subset only, thicker outline + slightly larger)
+	# Highlight overlay
+	hi_node_trace = None
 	if highlight_nodes:
 		hi_nodes = [n for n in nodes if n in highlight_nodes]
 		if hi_nodes:
+			node_index = {n: i for i, n in enumerate(nodes)}
 			hi_x = [pos[n][0] for n in hi_nodes]
 			hi_y = [pos[n][1] for n in hi_nodes]
-			hi_sizes = []
-			hi_colors = []
-			hi_text = []
+			hi_sizes = [base_sizes[node_index[n]] * 1.2 for n in hi_nodes]
+			hi_colours = [colour_values[node_index[n]] for n in hi_nodes]
+			hi_text = [H.nodes[n].get("name", n) for n in hi_nodes]
 			hi_hover = []
-
-			node_index = {n: i for i, n in enumerate(nodes)}
 			for n in hi_nodes:
-				idx = node_index[n]
-				hi_sizes.append(base_sizes[idx] * 1.2)  # 20% larger
-				hi_colors.append(color_values[idx])      # keep same colormap value
 				price_display = prices[n]
 				if isinstance(price_display, float) and np.isnan(price_display):
 					price_display = "N/A"
-				full_name = H.nodes[n].get("name", n)
 				hi_hover.append(
 					f"ID: {n}<br>"
-					f"Name: {full_name}<br>"
+					f"Name: {H.nodes[n].get('name', n)}<br>"
 					f"Price: {price_display}<br>"
 					f"In-degree: {indeg.get(n, 0)}"
 				)
-				# Always show label for highlighted, plus if already in top_label_nodes
-				hi_text.append(full_name)
-
 			hi_node_trace = go.Scatter(
 				x=hi_x, y=hi_y,
 				mode="markers+text",
@@ -408,30 +539,32 @@ def plot_graph(H: nx.DiGraph,
 				hovertext=hi_hover,
 				hoverinfo="text",
 				marker=dict(
-					showscale=False,           # avoid duplicate colorbar
-					colorscale=colorscale_name,
+					showscale=False,
+					colorscale=colourscale_name,
 					reversescale=True,
-					color=hi_colors,
+					color=hi_colours,
 					cmin=cmin,
 					cmax=cmax,
 					size=hi_sizes,
-					line=dict(width=3, color="#000")  # thick black outline
+					line=dict(width=3, color="#000")
 				),
 				name="Highlighted"
 			)
-		else:
-			hi_node_trace = None
-	else:
-		hi_node_trace = None
 
-	traces = [base_edge_trace, hi_edge_trace, base_node_trace]
+	# Community hulls (drawn beneath edges/nodes)
+	traces = []
+	if show_communities:
+		hulls = community_hulls_traces(H, pos, min_size=community_min_size, opacity=community_opacity)
+		traces.extend(hulls)
+
+	traces.extend([base_edge_trace, hi_edge_trace, base_node_trace])
 	if hi_node_trace is not None:
 		traces.append(hi_node_trace)
 
 	fig = go.Figure(
 		data=traces,
 		layout=go.Layout(
-			title=dict(text="Product Recommendation Network (Top-N hubs + neighbors)", font=dict(size=20)),
+			title=dict(text="Product Recommendation Network (Top-N hubs + neighbours)", font=dict(size=20)),
 			showlegend=False,
 			hovermode="closest",
 			margin=dict(b=20, l=5, r=5, t=50),
@@ -481,14 +614,14 @@ if not uploaded:
 df = load_csv(uploaded)
 
 # Sidebar controls — Filters
-st.sidebar.header("Filters (Contextual)")
+st.sidebar.header("Filters (contextual)")
 brand_vals = sorted(df.get("brand_name", pd.Series(dtype=str)).dropna().unique().tolist())
 type_vals  = sorted(df.get("type", pd.Series(dtype=str)).dropna().unique().tolist())
 
 brand_filter = st.sidebar.multiselect("brand_name", brand_vals)
 type_filter  = st.sidebar.multiselect("type", type_vals)
 
-# Product name filter for graph content (Option B)
+# Product name filter for graph content
 st.sidebar.markdown("---")
 name_query = st.sidebar.text_input("Product name contains (case-insensitive)", "")
 df["_full_name"] = (df.get("product_name", "").fillna("").astype(str).str.strip() + " " +
@@ -504,11 +637,14 @@ st.sidebar.header("Display")
 top_n = st.sidebar.slider("Top-N hubs (by in-degree)", min_value=10, max_value=1000, value=100, step=10)
 label_top_percent = st.sidebar.slider("Label top % nodes (by in-degree)", min_value=1, max_value=50, value=10, step=1)
 
-# Color scale options + percentile slider for clipping
-color_mode = st.sidebar.selectbox("Color scale for price", ["Log (base 10)", "Linear", "Clipped (percentile)"])
+# Layout selector
+layout_choice = st.sidebar.selectbox("Layout", ["Radial by in-degree (bullseye)", "Kamada–Kawai", "Spring"])
+
+# Price colour options + percentile slider for clipping
+colour_mode = st.sidebar.selectbox("Colour scale for price", ["Clipped (percentile)", "Log (base 10)", "Linear"])
 clip_pct = 95.0
-if color_mode == "Clipped (percentile)":
-	clip_pct = st.sidebar.slider("Clip at percentile", min_value=1.0, max_value=99.9, value=80.0, step=0.1)
+if colour_mode == "Clipped (percentile)":
+	clip_pct = st.sidebar.slider("Clip at percentile", min_value=1.0, max_value=99.9, value=95.0, step=0.1)
 
 graph_height = st.sidebar.slider("Graph height (px)", 500, 1600, 900, step=50)
 
@@ -517,17 +653,22 @@ st.sidebar.markdown("---")
 min_size = st.sidebar.slider("Min bubble size (px)", 4, 30, 8)
 max_size = st.sidebar.slider("Max bubble size (px)", 20, 160, 50)
 
+# Communities
+st.sidebar.markdown("---")
+show_communities = st.sidebar.checkbox("Show community hulls (Louvain)", value=False)
+community_min_size = st.sidebar.slider("Min community size to draw hull", 3, 200, 15, step=1)
+community_opacity = st.sidebar.slider("Community hull opacity", 0.05, 0.6, 0.2, step=0.05)
+
 # ----------------------------
 # Search Highlight (overlay)
 # ----------------------------
-st.sidebar.header("Search Highlight")
+st.sidebar.header("Search highlight")
 hl_name_query = st.sidebar.text_input("Highlight: name contains", "")
 hl_suggestions = []
 if hl_name_query.strip():
 	hl_suggestions = sorted(df.loc[df["_full_name"].str.contains(hl_name_query.strip(), case=False, na=False), "_full_name"]
 							.dropna().unique().tolist())[:200]
 hl_name_exact = st.sidebar.multiselect("Highlight: pick exact product(s)", hl_suggestions)
-
 hl_ids_raw = st.sidebar.text_input("Highlight: DM IDs (comma/space)", "")
 hl_ids = set()
 if hl_ids_raw.strip():
@@ -544,13 +685,12 @@ G_full = build_graph(
 	name_exact=name_exact
 )
 
-# Build Option-B Top-N subgraph: hubs + neighbors
-H = top_n_with_neighbors(G_full, top_n=top_n)
+# Build Top-N subgraph: hubs + neighbours
+H = top_n_with_neighbours(G_full, top_n=top_n)
 
 # Build highlight set mapped into H (by name & ID)
 highlight_nodes = set()
 if H.number_of_nodes() > 0:
-	# Map node -> name in H
 	names_map_H = nx.get_node_attributes(H, "name")
 	if hl_name_query and hl_name_query.strip():
 		q = hl_name_query.strip().lower()
@@ -562,19 +702,23 @@ if H.number_of_nodes() > 0:
 		highlight_nodes |= {n for n in H.nodes() if n in hl_ids}
 
 st.write(f"**Filtered graph:** {G_full.number_of_nodes()} nodes / {G_full.number_of_edges()} edges")
-st.write(f"**Displayed subgraph (Top-{top_n} hubs + neighbors):** {H.number_of_nodes()} nodes / {H.number_of_edges()} edges")
+st.write(f"**Displayed subgraph (Top-{top_n} hubs + neighbours):** {H.number_of_nodes()} nodes / {H.number_of_edges()} edges")
 if highlight_nodes:
 	st.write(f"**Highlighted nodes:** {len(highlight_nodes)}")
 
 fig = plot_graph(
 	H,
 	label_top_percent=label_top_percent,
-	color_mode=color_mode,
+	colour_mode=colour_mode,
 	clip_pct=clip_pct,
 	min_size=min_size,
 	max_size=max_size,
 	height=graph_height,
-	highlight_nodes=highlight_nodes
+	highlight_nodes=highlight_nodes,
+	layout_choice=layout_choice,
+	show_communities=show_communities,
+	community_min_size=community_min_size,
+	community_opacity=community_opacity
 )
 st.plotly_chart(fig, use_container_width=True)
 
